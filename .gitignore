@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.py[cod]
+mensajes.db
+mensajes.db-journal
+mensajes.db-wal
+mensajes.db-shm
+.env
