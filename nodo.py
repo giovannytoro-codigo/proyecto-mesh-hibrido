@@ -305,4 +305,175 @@ async def escuchar_nodo(websocket):
         ttl = int(data.get("ttl", 1))
         cifrado = bool(data.get("cifrado", False))
 
-        if cifrado
+        if cifrado and "payload_cifrado" in data:
+            texto_mostrado, ok_descifrado = descifrar_payload(str(data["payload_cifrado"]))
+            etiqueta_cifrado = "🔐 descifrado" if ok_descifrado else "⚠️ error-clave"
+        else:
+            texto_mostrado = str(data.get("payload", ""))
+            etiqueta_cifrado = "🔓 plano"
+
+        es_para_mi = destino in (NODE_ID, "broadcast")
+        estado_db = "recibido" if es_para_mi else "en_transito"
+
+        if DB_CONN is not None and msg_id:
+            guardar_mensaje_db(
+                DB_CONN,
+                msg_id=msg_id,
+                direccion="entrante",
+                origen=origen,
+                destino=destino,
+                ttl=ttl,
+                payload=texto_mostrado,
+                estado=estado_db,
+            )
+
+        if es_para_mi:
+            print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
+        else:
+            print(f"\n[🔀 TRÁNSITO {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]")
+
+        await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
+
+        if destino != NODE_ID:
+            await reenviar_paquete(data, excluir_ids={origen})
+
+
+async def iniciar_servidor():
+    servidor = await websockets.serve(escuchar_nodo, "0.0.0.0", PUERTO)
+    print(f"🟢 [{NODE_ID}] escuchando en puerto {PUERTO}...")
+    await servidor.wait_closed()
+
+
+async def consola_envio() -> None:
+    await asyncio.sleep(2)
+    while True:
+        objetivo = await asyncio.to_thread(
+            input,
+            "\nDestino ('broadcast', ID de vecino, 'vecinos', o 'historial'): ",
+        )
+        objetivo = objetivo.strip()
+
+        if not objetivo or objetivo.lower() == "vecinos":
+            if not VECINOS:
+                print("ℹ️ Aún no hay vecinos descubiertos en la red local.")
+            else:
+                for vid, info in VECINOS.items():
+                    print(f"  - {vid}: {info['ip']}:{info['port']}")
+            continue
+
+        if objetivo.lower() == "historial":
+            if DB_CONN is None:
+                print("⚠️ Base de datos no inicializada.")
+                continue
+            filas = consultar_historial(DB_CONN, limite=10)
+            if not filas:
+                print("ℹ️ No hay mensajes almacenados en mensajes.db.")
+            else:
+                print("\n--- Últimos mensajes en mensajes.db ---")
+                for direccion, origen, destino, ttl, estado, sync_flag, payload, creado_en in filas:
+                    etiqueta_sync = "sync=OK" if sync_flag else "sync=PEND"
+                    print(
+                        f"[{creado_en}] ({direccion} | {estado} | {etiqueta_sync} | TTL={ttl}) "
+                        f"{origen} -> {destino}: {payload}"
+                    )
+            continue
+
+        texto = await asyncio.to_thread(input, "Mensaje: ")
+        texto = texto.strip() or "Hola desde red Mesh híbrida"
+
+        ttl_entrada = await asyncio.to_thread(input, "TTL inicial (Enter para 3): ")
+        try:
+            ttl_valor = max(1, int(ttl_entrada.strip())) if ttl_entrada.strip() else 3
+        except ValueError:
+            ttl_valor = 3
+
+        msg_id = str(uuid.uuid4())
+        token_cifrado = cifrar_payload(texto)
+
+        paquete = {
+            "msg_id": msg_id,
+            "origen": NODE_ID,
+            "destino": objetivo,
+            "ttl": ttl_valor,
+            "cifrado": True,
+            "payload_cifrado": token_cifrado,
+        }
+        VISTO_IDS.add(msg_id)
+
+        if DB_CONN is not None:
+            guardar_mensaje_db(
+                DB_CONN,
+                msg_id=msg_id,
+                direccion="saliente",
+                origen=NODE_ID,
+                destino=objetivo,
+                ttl=ttl_valor,
+                payload=texto,
+                estado="enviado",
+            )
+
+        print(f"🔒 Token enviado por red: {token_cifrado[:28]}...")
+
+        if objetivo == "broadcast":
+            if not VECINOS:
+                print("⚠️ No hay vecinos conectados para hacer broadcast.")
+                continue
+            tareas = [
+                enviar_a_vecino(vid, datos, paquete) for vid, datos in VECINOS.items()
+            ]
+            await asyncio.gather(*tareas)
+        elif objetivo in VECINOS:
+            await enviar_a_vecino(objetivo, VECINOS[objetivo], paquete)
+        else:
+            print(f"⚠️ El vecino '{objetivo}' no está en VECINOS. Escribe 'vecinos' para ver activos.")
+
+
+async def ciclo_sincronizacion() -> None:
+    await asyncio.sleep(3)
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while True:
+            try:
+                if DB_CONN is not None:
+                    pendientes = obtener_pendientes_sync(DB_CONN, limite=50)
+                    if pendientes:
+                        resp = await client.post(SYNC_URL, json={"mensajes": pendientes})
+                        resp.raise_for_status()
+                        ids_ok = resp.json().get("ids_confirmados", [])
+                        marcar_sincronizados(DB_CONN, ids_ok)
+                        print(f"\n[☁️ SYNC OK] {len(ids_ok)} mensaje(s) enviados a PostgreSQL.")
+            except Exception as exc:
+                print(f"\n[⏳ SYNC PENDIENTE] Sin enlace a FastAPI/PostgreSQL ({exc}). Se reintentará.")
+            await asyncio.sleep(SYNC_INTERVALO)
+
+
+async def main() -> None:
+    global DB_CONN, VISTO_IDS
+
+    DB_CONN = inicializar_db(DB_PATH)
+    VISTO_IDS = cargar_ids_vistos(DB_CONN)
+    print(f"🗄️ Base de datos '{DB_PATH}' lista ({len(VISTO_IDS)} IDs previos cargados).")
+
+    bucle = asyncio.get_running_loop()
+    ip_local = obtener_ip_local()
+    aiozc, info, navegador = await registrar_zeroconf(bucle, ip_local)
+
+    try:
+        await asyncio.gather(
+            iniciar_servidor(),
+            consola_envio(),
+            ciclo_sincronizacion(),
+        )
+    finally:
+        navegador.cancel()
+        await aiozc.async_unregister_service(info)
+        await aiozc.async_close()
+        if DB_CONN is not None:
+            DB_CONN.close()
+        print("🛑 Servicio Zeroconf y base de datos detenidos limpiamente.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Nodo detenido.")
