@@ -14,8 +14,6 @@ PUERTO = 8765
 TIPO_SERVICIO = "_meshmsg._tcp.local."
 DB_PATH = "mensajes.db"
 
-# Clave Fernet compartida para pruebas de laboratorio entre nodos.
-# En producción se recomienda cargar desde variable de entorno o intercambio de claves.
 CLAVE_FERNET = b"mP8xQ2vL9nR4tY7wZ1bC5dF8gH0jK3mN6pQ9rS2tV4w="
 CIPHER = Fernet(CLAVE_FERNET)
 
@@ -186,6 +184,50 @@ async def registrar_zeroconf(loop: asyncio.AbstractEventLoop, ip_local: str):
     return aiozc, info, navegador
 
 
+async def enviar_a_vecino(
+    vecino_id: str, datos_vecino: dict, paquete: dict, actualizar_ack: bool = True
+) -> None:
+    uri = f"ws://{datos_vecino['ip']}:{datos_vecino['port']}"
+    try:
+        async with websockets.connect(uri, open_timeout=3) as websocket:
+            await websocket.send(json.dumps(paquete))
+            confirmacion = await websocket.recv()
+            print(f"[✅ ACK de {vecino_id} ({uri})]: {confirmacion}")
+            if actualizar_ack and DB_CONN is not None:
+                actualizar_estado_mensaje(DB_CONN, paquete["msg_id"], "ack_recibido")
+    except Exception as exc:
+        print(f"❌ Error enviando a {vecino_id} ({uri}): {exc}")
+
+
+async def reenviar_paquete(paquete: dict, excluir_ids: set[str]) -> None:
+    ttl_actual = int(paquete.get("ttl", 1))
+    if ttl_actual <= 1:
+        print(f"⏹️ [TTL agotado] No se reenvía msg_id={paquete.get('msg_id')} (TTL={ttl_actual}).")
+        return
+
+    paquete_reenvio = dict(paquete)
+    paquete_reenvio["ttl"] = ttl_actual - 1
+
+    candidatos = {
+        vid: datos
+        for vid, datos in VECINOS.items()
+        if vid != NODE_ID and vid not in excluir_ids
+    }
+    if not candidatos:
+        print(f"ℹ️ Sin vecinos alternativos para reenviar msg_id={paquete.get('msg_id')}.")
+        return
+
+    print(
+        f"🔁 [REENVÍO] msg_id={paquete.get('msg_id')} hacia {list(candidatos.keys())} "
+        f"con nuevo TTL={paquete_reenvio['ttl']}"
+    )
+    tareas = [
+        enviar_a_vecino(vid, datos, paquete_reenvio, actualizar_ack=False)
+        for vid, datos in candidatos.items()
+    ]
+    await asyncio.gather(*tareas)
+
+
 async def escuchar_nodo(websocket):
     async for raw in websocket:
         try:
@@ -197,6 +239,8 @@ async def escuchar_nodo(websocket):
 
         msg_id = data.get("msg_id")
         if msg_id in VISTO_IDS:
+            print(f"\n[♻️ DUPLICADO DESCARTADO] msg_id={msg_id}")
+            await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID, "dup": True}))
             continue
         if msg_id:
             VISTO_IDS.add(msg_id)
@@ -213,6 +257,9 @@ async def escuchar_nodo(websocket):
             texto_mostrado = str(data.get("payload", ""))
             etiqueta_cifrado = "🔓 plano"
 
+        es_para_mi = destino in (NODE_ID, "broadcast")
+        estado_db = "recibido" if es_para_mi else "en_transito"
+
         if DB_CONN is not None and msg_id:
             guardar_mensaje_db(
                 DB_CONN,
@@ -222,30 +269,25 @@ async def escuchar_nodo(websocket):
                 destino=destino,
                 ttl=ttl,
                 payload=texto_mostrado,
-                estado="recibido",
+                estado=estado_db,
             )
 
-        print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
+        if es_para_mi:
+            print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
+        else:
+            print(f"\n[🔀 TRÁNSITO {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]")
+
         await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
+
+        # Reenvía si el destino no es este nodo (o si es broadcast con TTL restante)
+        if destino != NODE_ID:
+            await reenviar_paquete(data, excluir_ids={origen})
 
 
 async def iniciar_servidor():
     servidor = await websockets.serve(escuchar_nodo, "0.0.0.0", PUERTO)
     print(f"🟢 [{NODE_ID}] escuchando en puerto {PUERTO}...")
     await servidor.wait_closed()
-
-
-async def enviar_a_vecino(vecino_id: str, datos_vecino: dict, paquete: dict) -> None:
-    uri = f"ws://{datos_vecino['ip']}:{datos_vecino['port']}"
-    try:
-        async with websockets.connect(uri, open_timeout=3) as websocket:
-            await websocket.send(json.dumps(paquete))
-            confirmacion = await websocket.recv()
-            print(f"[✅ ACK de {vecino_id} ({uri})]: {confirmacion}")
-            if DB_CONN is not None:
-                actualizar_estado_mensaje(DB_CONN, paquete["msg_id"], "ack_recibido")
-    except Exception as exc:
-        print(f"❌ Error enviando a {vecino_id} ({uri}): {exc}")
 
 
 async def consola_envio() -> None:
@@ -282,7 +324,13 @@ async def consola_envio() -> None:
             continue
 
         texto = await asyncio.to_thread(input, "Mensaje: ")
-        texto = texto.strip() or "Hola desde red Mesh cifrada"
+        texto = texto.strip() or "Hola desde red Mesh multi-salto"
+
+        ttl_entrada = await asyncio.to_thread(input, "TTL inicial (Enter para 3): ")
+        try:
+            ttl_valor = max(1, int(ttl_entrada.strip())) if ttl_entrada.strip() else 3
+        except ValueError:
+            ttl_valor = 3
 
         msg_id = str(uuid.uuid4())
         token_cifrado = cifrar_payload(texto)
@@ -291,7 +339,7 @@ async def consola_envio() -> None:
             "msg_id": msg_id,
             "origen": NODE_ID,
             "destino": objetivo,
-            "ttl": 3,
+            "ttl": ttl_valor,
             "cifrado": True,
             "payload_cifrado": token_cifrado,
         }
@@ -304,7 +352,7 @@ async def consola_envio() -> None:
                 direccion="saliente",
                 origen=NODE_ID,
                 destino=objetivo,
-                ttl=3,
+                ttl=ttl_valor,
                 payload=texto,
                 estado="enviado",
             )
