@@ -4,6 +4,7 @@ import json
 import socket
 import sqlite3
 import uuid
+from cryptography.fernet import Fernet, InvalidToken
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 from zeroconf.asyncio import AsyncZeroconf
 import websockets
@@ -13,9 +14,26 @@ PUERTO = 8765
 TIPO_SERVICIO = "_meshmsg._tcp.local."
 DB_PATH = "mensajes.db"
 
+# Clave Fernet compartida para pruebas de laboratorio entre nodos.
+# En producción se recomienda cargar desde variable de entorno o intercambio de claves.
+CLAVE_FERNET = b"mP8xQ2vL9nR4tY7wZ1bC5dF8gH0jK3mN6pQ9rS2tV4w="
+CIPHER = Fernet(CLAVE_FERNET)
+
 VISTO_IDS = set()
 VECINOS = {}  # {node_id: {"ip": "192.168.x.x", "port": 8765}}
 DB_CONN: sqlite3.Connection | None = None
+
+
+def cifrar_payload(texto_plano: str) -> str:
+    return CIPHER.encrypt(texto_plano.encode("utf-8")).decode("utf-8")
+
+
+def descifrar_payload(token_cifrado: str) -> tuple[str, bool]:
+    try:
+        plano = CIPHER.decrypt(token_cifrado.encode("utf-8")).decode("utf-8")
+        return plano, True
+    except (InvalidToken, ValueError):
+        return token_cifrado, False
 
 
 def inicializar_db(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -186,7 +204,14 @@ async def escuchar_nodo(websocket):
         origen = data.get("origen", "desconocido")
         destino = data.get("destino", "broadcast")
         ttl = int(data.get("ttl", 1))
-        payload = str(data.get("payload", ""))
+        cifrado = bool(data.get("cifrado", False))
+
+        if cifrado and "payload_cifrado" in data:
+            texto_mostrado, ok_descifrado = descifrar_payload(str(data["payload_cifrado"]))
+            etiqueta_cifrado = "🔐 descifrado" if ok_descifrado else "⚠️ error-clave"
+        else:
+            texto_mostrado = str(data.get("payload", ""))
+            etiqueta_cifrado = "🔓 plano"
 
         if DB_CONN is not None and msg_id:
             guardar_mensaje_db(
@@ -196,11 +221,11 @@ async def escuchar_nodo(websocket):
                 origen=origen,
                 destino=destino,
                 ttl=ttl,
-                payload=payload,
+                payload=texto_mostrado,
                 estado="recibido",
             )
 
-        print(f"\n[📥 {origen} -> {destino} | TTL={ttl}]: {payload}")
+        print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
         await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
 
 
@@ -257,28 +282,34 @@ async def consola_envio() -> None:
             continue
 
         texto = await asyncio.to_thread(input, "Mensaje: ")
-        texto = texto.strip() or "Hola desde red Mesh con SQLite"
+        texto = texto.strip() or "Hola desde red Mesh cifrada"
+
+        msg_id = str(uuid.uuid4())
+        token_cifrado = cifrar_payload(texto)
 
         paquete = {
-            "msg_id": str(uuid.uuid4()),
+            "msg_id": msg_id,
             "origen": NODE_ID,
             "destino": objetivo,
             "ttl": 3,
-            "payload": texto,
+            "cifrado": True,
+            "payload_cifrado": token_cifrado,
         }
-        VISTO_IDS.add(paquete["msg_id"])
+        VISTO_IDS.add(msg_id)
 
         if DB_CONN is not None:
             guardar_mensaje_db(
                 DB_CONN,
-                msg_id=paquete["msg_id"],
+                msg_id=msg_id,
                 direccion="saliente",
-                origen=paquete["origen"],
-                destino=paquete["destino"],
-                ttl=paquete["ttl"],
-                payload=paquete["payload"],
+                origen=NODE_ID,
+                destino=objetivo,
+                ttl=3,
+                payload=texto,
                 estado="enviado",
             )
+
+        print(f"🔒 Token enviado por red: {token_cifrado[:28]}...")
 
         if objetivo == "broadcast":
             if not VECINOS:
