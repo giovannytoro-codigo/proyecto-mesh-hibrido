@@ -1,6 +1,8 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import socket
+import sqlite3
 import uuid
 from zeroconf import ServiceBrowser, ServiceInfo, ServiceListener, Zeroconf
 from zeroconf.asyncio import AsyncZeroconf
@@ -9,9 +11,85 @@ import websockets
 NODE_ID = "nodo-portatil-1"  # En el segundo portátil usa "nodo-portatil-2"
 PUERTO = 8765
 TIPO_SERVICIO = "_meshmsg._tcp.local."
+DB_PATH = "mensajes.db"
 
 VISTO_IDS = set()
 VECINOS = {}  # {node_id: {"ip": "192.168.x.x", "port": 8765}}
+DB_CONN: sqlite3.Connection | None = None
+
+
+def inicializar_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mensajes (
+            msg_id TEXT PRIMARY KEY,
+            direccion TEXT NOT NULL,
+            origen TEXT NOT NULL,
+            destino TEXT NOT NULL,
+            ttl INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            estado TEXT NOT NULL,
+            creado_en TEXT NOT NULL,
+            actualizado_en TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def cargar_ids_vistos(conn: sqlite3.Connection) -> set[str]:
+    cursor = conn.execute("SELECT msg_id FROM mensajes")
+    return {fila[0] for fila in cursor.fetchall()}
+
+
+def guardar_mensaje_db(
+    conn: sqlite3.Connection,
+    msg_id: str,
+    direccion: str,
+    origen: str,
+    destino: str,
+    ttl: int,
+    payload: str,
+    estado: str,
+) -> None:
+    ahora = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO mensajes (
+            msg_id, direccion, origen, destino, ttl, payload, estado, creado_en, actualizado_en
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (msg_id, direccion, origen, destino, ttl, payload, estado, ahora, ahora),
+    )
+    conn.commit()
+
+
+def actualizar_estado_mensaje(conn: sqlite3.Connection, msg_id: str, nuevo_estado: str) -> None:
+    ahora = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE mensajes
+        SET estado = ?, actualizado_en = ?
+        WHERE msg_id = ?
+        """,
+        (nuevo_estado, ahora, msg_id),
+    )
+    conn.commit()
+
+
+def consultar_historial(conn: sqlite3.Connection, limite: int = 10) -> list[tuple]:
+    cursor = conn.execute(
+        """
+        SELECT direccion, origen, destino, ttl, estado, payload, creado_en
+        FROM mensajes
+        ORDER BY creado_en DESC
+        LIMIT ?
+        """,
+        (limite,),
+    )
+    return cursor.fetchall()
 
 
 def obtener_ip_local() -> str:
@@ -107,8 +185,20 @@ async def escuchar_nodo(websocket):
 
         origen = data.get("origen", "desconocido")
         destino = data.get("destino", "broadcast")
-        ttl = data.get("ttl", 1)
-        payload = data.get("payload", "")
+        ttl = int(data.get("ttl", 1))
+        payload = str(data.get("payload", ""))
+
+        if DB_CONN is not None and msg_id:
+            guardar_mensaje_db(
+                DB_CONN,
+                msg_id=msg_id,
+                direccion="entrante",
+                origen=origen,
+                destino=destino,
+                ttl=ttl,
+                payload=payload,
+                estado="recibido",
+            )
 
         print(f"\n[📥 {origen} -> {destino} | TTL={ttl}]: {payload}")
         await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
@@ -127,6 +217,8 @@ async def enviar_a_vecino(vecino_id: str, datos_vecino: dict, paquete: dict) -> 
             await websocket.send(json.dumps(paquete))
             confirmacion = await websocket.recv()
             print(f"[✅ ACK de {vecino_id} ({uri})]: {confirmacion}")
+            if DB_CONN is not None:
+                actualizar_estado_mensaje(DB_CONN, paquete["msg_id"], "ack_recibido")
     except Exception as exc:
         print(f"❌ Error enviando a {vecino_id} ({uri}): {exc}")
 
@@ -136,7 +228,7 @@ async def consola_envio() -> None:
     while True:
         objetivo = await asyncio.to_thread(
             input,
-            "\nDestino ('broadcast', ID de vecino, o 'vecinos' para listar): ",
+            "\nDestino ('broadcast', ID de vecino, 'vecinos', o 'historial'): ",
         )
         objetivo = objetivo.strip()
 
@@ -148,8 +240,24 @@ async def consola_envio() -> None:
                     print(f"  - {vid}: {info['ip']}:{info['port']}")
             continue
 
+        if objetivo.lower() == "historial":
+            if DB_CONN is None:
+                print("⚠️ Base de datos no inicializada.")
+                continue
+            filas = consultar_historial(DB_CONN, limite=10)
+            if not filas:
+                print("ℹ️ No hay mensajes almacenados en mensajes.db.")
+            else:
+                print("\n--- Últimos mensajes en mensajes.db ---")
+                for direccion, origen, destino, ttl, estado, payload, creado_en in filas:
+                    print(
+                        f"[{creado_en}] ({direccion} | {estado} | TTL={ttl}) "
+                        f"{origen} -> {destino}: {payload}"
+                    )
+            continue
+
         texto = await asyncio.to_thread(input, "Mensaje: ")
-        texto = texto.strip() or "Hola desde red Mesh con Zeroconf"
+        texto = texto.strip() or "Hola desde red Mesh con SQLite"
 
         paquete = {
             "msg_id": str(uuid.uuid4()),
@@ -159,6 +267,18 @@ async def consola_envio() -> None:
             "payload": texto,
         }
         VISTO_IDS.add(paquete["msg_id"])
+
+        if DB_CONN is not None:
+            guardar_mensaje_db(
+                DB_CONN,
+                msg_id=paquete["msg_id"],
+                direccion="saliente",
+                origen=paquete["origen"],
+                destino=paquete["destino"],
+                ttl=paquete["ttl"],
+                payload=paquete["payload"],
+                estado="enviado",
+            )
 
         if objetivo == "broadcast":
             if not VECINOS:
@@ -175,6 +295,12 @@ async def consola_envio() -> None:
 
 
 async def main() -> None:
+    global DB_CONN, VISTO_IDS
+
+    DB_CONN = inicializar_db(DB_PATH)
+    VISTO_IDS = cargar_ids_vistos(DB_CONN)
+    print(f"🗄️ Base de datos '{DB_PATH}' lista ({len(VISTO_IDS)} IDs previos cargados).")
+
     bucle = asyncio.get_running_loop()
     ip_local = obtener_ip_local()
     aiozc, info, navegador = await registrar_zeroconf(bucle, ip_local)
@@ -188,7 +314,9 @@ async def main() -> None:
         navegador.cancel()
         await aiozc.async_unregister_service(info)
         await aiozc.async_close()
-        print("🛑 Servicio Zeroconf detenido limpiamente.")
+        if DB_CONN is not None:
+            DB_CONN.close()
+        print("🛑 Servicio Zeroconf y base de datos detenidos limpiamente.")
 
 
 if __name__ == "__main__":
