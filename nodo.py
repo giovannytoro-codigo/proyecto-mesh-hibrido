@@ -285,58 +285,69 @@ async def reenviar_paquete(paquete: dict, excluir_ids: set[str]) -> None:
 
 
 async def escuchar_nodo(websocket):
-    async for raw in websocket:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            print(f"\n[📥 TEXTO PLANO]: {raw}")
-            await websocket.send(json.dumps({"ack": "texto-recibido", "desde": NODE_ID}))
-            continue
+    cliente_id_registrado: str | None = None
+    try:
+        async for raw in websocket:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                print(f"\n[📥 TEXTO PLANO]: {raw}")
+                await websocket.send(json.dumps({"ack": "texto-recibido", "desde": NODE_ID}))
+                continue
 
-        msg_id = data.get("msg_id")
-        if msg_id in VISTO_IDS:
-            print(f"\n[♻️ DUPLICADO DESCARTADO] msg_id={msg_id}")
-            await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID, "dup": True}))
-            continue
-        if msg_id:
-            VISTO_IDS.add(msg_id)
+            msg_id = data.get("msg_id")
+            if msg_id in VISTO_IDS:
+                print(f"\n[♻️ DUPLICADO DESCARTADO] msg_id={msg_id}")
+                await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID, "dup": True}))
+                continue
+            if msg_id:
+                VISTO_IDS.add(msg_id)
 
-        origen = data.get("origen", "desconocido")
-        destino = data.get("destino", "broadcast")
-        ttl = int(data.get("ttl", 1))
-        cifrado = bool(data.get("cifrado", False))
+            origen = data.get("origen", "desconocido")
+            if origen != "desconocido":
+                CLIENTES_WS[origen] = websocket
+                cliente_id_registrado = origen
 
-        if cifrado and "payload_cifrado" in data:
-            texto_mostrado, ok_descifrado = descifrar_payload(str(data["payload_cifrado"]))
-            etiqueta_cifrado = "🔐 descifrado" if ok_descifrado else "⚠️ error-clave"
-        else:
-            texto_mostrado = str(data.get("payload", ""))
-            etiqueta_cifrado = "🔓 plano"
+            destino = data.get("destino", "broadcast")
+            ttl = int(data.get("ttl", 1))
+            cifrado = bool(data.get("cifrado", False))
 
-        es_para_mi = destino in (NODE_ID, "broadcast")
-        estado_db = "recibido" if es_para_mi else "en_transito"
+            if cifrado and "payload_cifrado" in data:
+                texto_mostrado, ok_descifrado = descifrar_payload(str(data["payload_cifrado"]))
+                etiqueta_cifrado = "🔐 descifrado" if ok_descifrado else "⚠️ error-clave"
+            else:
+                texto_mostrado = str(data.get("payload", ""))
+                etiqueta_cifrado = "🔓 plano"
 
-        if DB_CONN is not None and msg_id:
-            guardar_mensaje_db(
-                DB_CONN,
-                msg_id=msg_id,
-                direccion="entrante",
-                origen=origen,
-                destino=destino,
-                ttl=ttl,
-                payload=texto_mostrado,
-                estado=estado_db,
-            )
+            es_para_mi = destino in (NODE_ID, "broadcast")
+            estado_db = "recibido" if es_para_mi else "en_transito"
 
-        if es_para_mi:
-            print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
-        else:
-            print(f"\n[🔀 TRÁNSITO {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]")
+            if DB_CONN is not None and msg_id:
+                guardar_mensaje_db(
+                    DB_CONN,
+                    msg_id=msg_id,
+                    direccion="entrante",
+                    origen=origen,
+                    destino=destino,
+                    ttl=ttl,
+                    payload=texto_mostrado,
+                    estado=estado_db,
+                )
 
-        await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
+            if es_para_mi:
+                print(f"\n[📥 {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]: {texto_mostrado}")
+            else:
+                print(f"\n[🔀 TRÁNSITO {origen} -> {destino} | TTL={ttl} | {etiqueta_cifrado}]")
 
-        if destino != NODE_ID:
-            await reenviar_paquete(data, excluir_ids={origen})
+            await websocket.send(json.dumps({"ack": msg_id, "desde": NODE_ID}))
+
+            if destino != NODE_ID:
+                await reenviar_paquete(data, excluir_ids={origen})
+    except (websockets.ConnectionClosed, ConnectionResetError, OSError):
+        pass
+    finally:
+        if cliente_id_registrado and CLIENTES_WS.get(cliente_id_registrado) is websocket:
+            CLIENTES_WS.pop(cliente_id_registrado, None)
 
 
 async def iniciar_servidor():
@@ -360,6 +371,8 @@ async def consola_envio() -> None:
             else:
                 for vid, info in VECINOS.items():
                     print(f"  - {vid}: {info['ip']}:{info['port']}")
+            if CLIENTES_WS:
+                print(f"  - Clientes WS activos: {list(CLIENTES_WS.keys())}")
             continue
 
         if objetivo.lower() == "historial":
@@ -390,6 +403,7 @@ async def consola_envio() -> None:
 
         msg_id = str(uuid.uuid4())
         token_cifrado = cifrar_payload(texto)
+        print(f"🔒 Token enviado por red: {token_cifrado[:28]}...")
 
         paquete = {
             "msg_id": msg_id,
@@ -413,20 +427,51 @@ async def consola_envio() -> None:
                 estado="enviado",
             )
 
-        print(f"🔒 Token enviado por red: {token_cifrado[:28]}...")
+        paquete_ws_cliente = {
+            "msg_id": msg_id,
+            "origen": NODE_ID,
+            "destino": objetivo,
+            "ttl": ttl_valor,
+            "cifrado": False,
+            "payload": texto,
+        }
 
         if objetivo == "broadcast":
-            if not VECINOS:
-                print("⚠️ No hay vecinos conectados para hacer broadcast.")
-                continue
-            tareas = [
-                enviar_a_vecino(vid, datos, paquete) for vid, datos in VECINOS.items()
-            ]
-            await asyncio.gather(*tareas)
-        elif objetivo in VECINOS:
+            enviado_algo = False
+            if VECINOS:
+                tareas = [
+                    enviar_a_vecino(vid, datos, paquete) for vid, datos in VECINOS.items()
+                ]
+                await asyncio.gather(*tareas)
+                enviado_algo = True
+            for cid, ws_cli in list(CLIENTES_WS.items()):
+                try:
+                    await ws_cli.send(json.dumps(paquete_ws_cliente))
+                    print(f"[📱 ENVIADO A CLIENTE WS] {cid}")
+                    enviado_algo = True
+                except Exception:
+                    CLIENTES_WS.pop(cid, None)
+            if not enviado_algo:
+                print("⚠️ No hay vecinos ni clientes conectados para hacer broadcast.")
+            continue
+
+        if objetivo in VECINOS:
             await enviar_a_vecino(objetivo, VECINOS[objetivo], paquete)
-        else:
-            print(f"⚠️ El vecino '{objetivo}' no está en VECINOS. Escribe 'vecinos' para ver activos.")
+            continue
+
+        if objetivo in CLIENTES_WS:
+            try:
+                await CLIENTES_WS[objetivo].send(json.dumps(paquete_ws_cliente))
+                print(f"[📱 ENVIADO A CLIENTE WS] {objetivo}")
+            except Exception as exc:
+                print(f"❌ Error enviando a cliente '{objetivo}': {exc}")
+                CLIENTES_WS.pop(objetivo, None)
+            continue
+
+        print(
+            f"⚠️ '{objetivo}' no está en VECINOS ni en CLIENTES_WS activos. "
+            f"Clientes WS: {list(CLIENTES_WS.keys())}"
+        )
 
 
 async def ciclo_sincronizacion() -> None:
