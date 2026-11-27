@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#00a884" />
+  <link rel="manifest" href="manifest.json" />
+  <title>MeshChat Campo</title>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; background: #0b141a; color: #e9edef; display: flex; flex-direction: column; height: 100vh; }
+    header { background: #202c33; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a3942; }
+    .titulo { font-weight: 700; font-size: 16px; }
+    .estado { font-size: 12px; padding: 4px 8px; border-radius: 999px; background: #3b2326; color: #f87171; }
+    .estado.ok { background: #14362a; color: #34d399; }
+    .barra-config { background: #111b21; padding: 8px 12px; display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; border-bottom: 1px solid #222e35; }
+    input, select, button { border-radius: 8px; border: 1px solid #2a3942; background: #2a3942; color: #e9edef; padding: 8px 10px; font-size: 14px; }
+    button { background: #00a884; color: #111b21; font-weight: 700; border: none; cursor: pointer; }
+    button.sec { background: #2a3942; color: #e9edef; }
+    .barra-destino { background: #111b21; padding: 8px 12px; display: flex; gap: 8px; align-items: center; }
+    .barra-destino label { font-size: 12px; color: #8696a0; }
+    #chat { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: #0b141a; }
+    .msg { max-width: 82%; padding: 8px 12px; border-radius: 10px; font-size: 14px; line-height: 1.35; word-wrap: break-word; }
+    .msg.mio { align-self: flex-end; background: #005c4b; }
+    .msg.otro { align-self: flex-start; background: #202c33; }
+    .meta { font-size: 11px; color: #aebac1; margin-top: 4px; display: flex; justify-content: space-between; gap: 10px; }
+    footer { background: #202c33; padding: 10px 12px; display: flex; gap: 8px; }
+    footer input { flex: 1; }
+    .panel-cfg { display: none; background: #111b21; padding: 10px 12px; border-bottom: 1px solid #222e35; gap: 8px; flex-direction: column; }
+    .panel-cfg.visible { display: flex; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="titulo">MeshChat Campo</div>
+      <div id="subtitulo-id" style="font-size:11px;color:#8696a0;"></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span id="badge-estado" class="estado">Desconectado</span>
+      <button class="sec" onclick="toggleCfg()">⚙️</button>
+    </div>
+  </header>
+
+  <div id="panel-cfg" class="panel-cfg">
+    <input id="cfg-ws" placeholder="ws://192.168.40.54:8765" />
+    <div style="display:flex;gap:8px;">
+      <input id="cfg-mi-id" placeholder="Tu ID (ej. cel-campo-1)" style="flex:1;" />
+      <input id="cfg-ttl" type="number" min="1" max="10" value="3" style="width:72px;" />
+      <button onclick="guardarCfg()">Conectar</button>
+    </div>
+  </div>
+
+  <div class="barra-destino">
+    <label>Para:</label>
+    <input id="destino" value="broadcast" placeholder="broadcast o ID de nodo" style="flex:1;" />
+    <button type="button" onclick="fijarBroadcast()" style="padding:7px 10px;font-size:12px;">📢 Broadcast</button>
+    <button type="button" class="sec" onclick="fijarDestino('nodo-portatil-1')" style="padding:7px 10px;font-size:12px;">P1</button>
+    <button type="button" class="sec" onclick="fijarDestino('nodo-portatil-2')" style="padding:7px 10px;font-size:12px;">P2</button>
+  </div>
+
+  <div id="chat"></div>
+
+  <footer>
+    <input id="texto-msg" placeholder="Escribe un mensaje..." onkeydown="if(event.key==='Enter') enviarMensaje()" />
+    <button onclick="enviarMensaje()">Enviar</button>
+  </footer>
+
+  <script>
+     function fijarDestino(id) {
+      document.getElementById("destino").value = id;
+     }
+
+    function fijarBroadcast() {
+      fijarDestino("broadcast");
+      document.getElementById("texto-msg").focus();
+    }
+
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("./sw.js").catch(() => {});
+    }
+
+    const STORAGE_CFG = "meshchat_cfg_v1";
+    const STORAGE_MSGS = "meshchat_msgs_v1";
+
+    function cargarCfg() {
+      const guardada = JSON.parse(localStorage.getItem(STORAGE_CFG) || "{}");
+      return {
+        wsUrl: guardada.wsUrl || "ws://192.168.40.54:8765",
+        miId: guardada.miId || ("cel-" + Math.random().toString(36).slice(2, 6)),
+        ttl: guardada.ttl || 3
+      };
+    }
+
+    let cfg = cargarCfg();
+    let mensajes = JSON.parse(localStorage.getItem(STORAGE_MSGS) || "[]");
+    let ws = null;
+    let reconectarTimer = null;
+
+    document.getElementById("cfg-ws").value = cfg.wsUrl;
+    document.getElementById("cfg-mi-id").value = cfg.miId;
+    document.getElementById("cfg-ttl").value = cfg.ttl;
+    document.getElementById("subtitulo-id").textContent = "ID: " + cfg.miId + " · " + cfg.wsUrl;
+
+    function toggleCfg() {
+      document.getElementById("panel-cfg").classList.toggle("visible");
+    }
+
+    function guardarCfg() {
+      cfg.wsUrl = document.getElementById("cfg-ws").value.trim() || cfg.wsUrl;
+      cfg.miId = document.getElementById("cfg-mi-id").value.trim() || cfg.miId;
+      cfg.ttl = Math.max(1, parseInt(document.getElementById("cfg-ttl").value || "3", 10));
+      localStorage.setItem(STORAGE_CFG, JSON.stringify(cfg));
+      document.getElementById("subtitulo-id").textContent = "ID: " + cfg.miId + " · " + cfg.wsUrl;
+      toggleCfg();
+      conectarWS(true);
+    }
+
+    function guardarMensajes() {
+      localStorage.setItem(STORAGE_MSGS, JSON.stringify(mensajes.slice(-150)));
+    }
+
+    function setConectado(ok) {
+      const badge = document.getElementById("badge-estado");
+      badge.textContent = ok ? "En malla" : "Sin enlace";
+      badge.className = ok ? "estado ok" : "estado";
+    }
+
+    function renderChat() {
+      const cont = document.getElementById("chat");
+      cont.innerHTML = "";
+      for (const m of mensajes) {
+        const div = document.createElement("div");
+        div.className = "msg " + (m.mio ? "mio" : "otro");
+        const estadoTxt = m.mio ? (m.ack ? "✓✓ ACK" : (m.enviado ? "✓ Enviado" : "🕒 Pendiente")) : "";
+        div.innerHTML = `
+          <div>${m.texto.replace(/</g, "&lt;")}</div>
+          <div class="meta">
+            <span>${m.origen} → ${m.destino} (TTL ${m.ttl})</span>
+            <span>${estadoTxt}</span>
+          </div>
+        `;
+        cont.appendChild(div);
+      }
+      cont.scrollTop = cont.scrollHeight;
+    }
+
+    function intentarEnviarCola() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      for (const m of mensajes) {
+        if (m.mio && !m.enviado) {
+          ws.send(JSON.stringify({
+            msg_id: m.msg_id,
+            origen: m.origen,
+            destino: m.destino,
+            ttl: m.ttl,
+            cifrado: false,
+            payload: m.texto
+          }));
+          m.enviado = true;
+        }
+      }
+      guardarMensajes();
+      renderChat();
+    }
+
+    function conectarWS(forzar = false) {
+      if (reconectarTimer) clearTimeout(reconectarTimer);
+      if (ws && !forzar && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      if (ws && forzar) {
+        try { ws.close(); } catch (_) {}
+      }
+      setConectado(false);
+      try {
+        ws = new WebSocket(cfg.wsUrl);
+      } catch (_) {
+        reconectarTimer = setTimeout(() => conectarWS(), 4000);
+        return;
+      }
+
+      ws.onopen = () => {
+        setConectado(true);
+        intentarEnviarCola();
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.ack) {
+            const obj = mensajes.find(x => x.msg_id === data.ack);
+            if (obj) {
+              obj.ack = true;
+              guardarMensajes();
+              renderChat();
+            }
+            return;
+          }
+          if (data.msg_id && !mensajes.some(x => x.msg_id === data.msg_id)) {
+            mensajes.push({
+              msg_id: data.msg_id,
+              origen: data.origen || "nodo",
+              destino: data.destino || "broadcast",
+              ttl: data.ttl || 1,
+              texto: data.payload || data.payload_cifrado || "",
+              mio: false,
+              enviado: true,
+              ack: false
+            });
+            guardarMensajes();
+            renderChat();
+          }
+        } catch (_) {}
+      };
+
+      ws.onclose = () => {
+        setConectado(false);
+        reconectarTimer = setTimeout(() => conectarWS(), 4000);
+      };
+
+      ws.onerror = () => {
+        setConectado(false);
+      };
+    }
+
+    function enviarMensaje() {
+      const input = document.getElementById("texto-msg");
+      const destinoInput = document.getElementById("destino");
+      const texto = input.value.trim();
+      if (!texto) return;
+
+      const msg_id = (crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8));
+
+      const nuevo = {
+        msg_id,
+        origen: cfg.miId,
+        destino: (destinoInput.value || "broadcast").trim(),
+        ttl: cfg.ttl,
+        texto,
+        mio: true,
+        enviado: false,
+        ack: false
+      };
+
+      mensajes.push(nuevo);
+      guardarMensajes();
+      renderChat();
+      input.value = "";
+      intentarEnviarCola();
+    }
+
+    renderChat();
+    conectarWS();
+  </script>
+</body>
+</html>
