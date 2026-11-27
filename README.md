@@ -43,6 +43,9 @@ flowchart TB
 ## Flujo de Mensajería y Sincronización (Secuencia)
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'background': '#0f172a', 'primaryColor': '#1e293b', 'primaryTextColor': '#f8fafc', 'primaryBorderColor': '#38bdf8', 'actorBkg': '#1e293b', 'actorTextColor': '#f8fafc', 'actorBorder': '#38bdf8', 'signalColor': '#e2e8f0', 'signalTextColor': '#f8fafc', 'labelBoxBkgColor': '#1e293b', 'labelBoxBorderColor': '#64748b', 'labelTextColor': '#f8fafc'}}}%%
+
+
 sequenceDiagram
     autonumber
     participant Cel as Celular (Juan)
@@ -106,3 +109,13 @@ python -m http.server 8080 --bind 0.0.0.0
 
 
 Luego abrir http://IP_PORTATIL_1:8080 desde el navegador del celular, configurar el nombre de usuario (por ejemplo Juan o Pedro) y la dirección ws://IP_PORTATIL_1:8765 en ⚙️, y seleccionar Agregar a pantalla de inicio.
+
+
+Patrones arquitectónicos aplicados
+El sistema combina tres patrones complementarios para mantener la comunicación operativa aun con conectividad intermitente o sin salida inmediata a la red central:
+
+Malla híbrida (mDNS + WebSockets): Los nodos (nodo-portatil-1 y nodo-portatil-2) se descubren de forma local y descentralizada mediante AsyncZeroconf (_meshmsg._tcp.local.), intercambian mensajes cifrados con Fernet sobre WebSockets (:8765), aplican control de saltos (TTL), deduplicación por msg_id (VISTO_IDS) y reenvío multi-salto, mientras los clientes móviles (iPhone y Android) se enlazan como borde al nodo disponible.
+
+Offline-first (SQLite y localStorage): Cada capa prioriza la persistencia local antes de depender de la red. En el móvil, la PWA (index.html) conserva historial, nombre de usuario y cola de mensajes pendientes en localStorage con reconexión automática; en cada nodo, mensajes.db (SQLite) registra entradas, salidas, estados y marcas de sincronización.
+
+Sincronización eventual: En lugar de exigir una conexión continua y síncrona con la base central, cada nodo ejecuta un ciclo periódico (ciclo_sincronizacion) que envía hacia FastAPI (POST /sync/mensajes) los registros pendientes (sincronizado = 0) hacia PostgreSQL (mesh_db) y marca como confirmados únicamente los ids_confirmados.
