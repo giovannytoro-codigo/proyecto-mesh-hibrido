@@ -24,6 +24,7 @@ CIPHER = Fernet(CLAVE_FERNET)
 
 VISTO_IDS = set()
 VECINOS = {}  # {node_id: {"ip": "192.168.x.x", "port": 8765}}
+CLIENTES_WS: dict[str, websockets.ServerConnection] = {}
 DB_CONN: sqlite3.Connection | None = None
 
 
