@@ -39,3 +39,29 @@ flowchart TB
     DB2 -.->|"ciclo_sincronizacion (HTTP JSON)"| API
     API -->|"UPSERT / Deduplicación msg_id"| PG
 ```
+
+## Flujo de Mensajería y Sincronización (Secuencia)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cel as Celular (Juan)
+    participant N1 as nodo-portatil-1
+    participant N2 as nodo-portatil-2
+    participant Sync as FastAPI + PostgreSQL
+
+    Cel->>Cel: Guarda mensaje en cola local (Pendiente)
+    Cel->>N1: WebSocket send (msg_id, origen=juan, destino, ttl)
+    N1->>N1: Deduplica (VISTO_IDS) & guarda en mensajes.db
+    N1-->>Cel: ACK (msg_id) -> Marca ✓✓ ACK
+    alt ttl > 1 y destino != N1
+        N1->>N2: Reenvía paquete (ttl - 1, Fernet)
+        N2->>N2: Guarda en mensajes.db & responde ACK
+        N2-->>N1: ACK
+    end
+    loop Cada SYNC_INTERVALO (si hay enlace)
+        N1->>Sync: POST /sync/mensajes (pendientes sincronizado=0)
+        Sync-->>N1: ids_confirmados
+        N1->>N1: Marca sincronizado = 1 en SQLite
+    end
+```
